@@ -44,6 +44,9 @@ impl CommandOutput {
 pub trait Process: Send {
     /// End it and reap it.
     fn stop(&mut self);
+
+    /// Has it ended? An ended program is reaped.
+    fn finished(&mut self) -> bool;
 }
 
 pub trait CommandRunner: Send + Sync {
@@ -170,14 +173,18 @@ impl CommandRunner for SystemRunner {
     }
 }
 
-/// A started child: it stays a zombie once it ends until stopped, as the
-/// Python's `Popen` does until its next poll.
+/// A started child: it stays a zombie once it ends until stopped or polled,
+/// as the Python's `Popen` does until its next poll.
 struct ChildProcess(std::process::Child);
 
 impl Process for ChildProcess {
     fn stop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+
+    fn finished(&mut self) -> bool {
+        !matches!(self.0.try_wait(), Ok(None))
     }
 }
 
@@ -257,6 +264,7 @@ pub mod fake {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use parking_lot::Mutex;
 
@@ -276,6 +284,8 @@ pub mod fake {
         pub started: Mutex<Vec<Vec<String>>>,
         /// The argv of every started program that was stopped, in order.
         pub stopped: Arc<Mutex<Vec<Vec<String>>>>,
+        /// What every started program answers to [`Process::finished`].
+        pub finished: Arc<AtomicBool>,
         pub answers: Mutex<HashMap<String, Answer>>,
         pub on_path: Mutex<Vec<String>>,
     }
@@ -283,11 +293,16 @@ pub mod fake {
     struct FakeProcess {
         argv: Vec<String>,
         stopped: Arc<Mutex<Vec<Vec<String>>>>,
+        finished: Arc<AtomicBool>,
     }
 
     impl Process for FakeProcess {
         fn stop(&mut self) {
             self.stopped.lock().push(self.argv.clone());
+        }
+
+        fn finished(&mut self) -> bool {
+            self.finished.load(Ordering::SeqCst)
         }
     }
 
@@ -349,6 +364,7 @@ pub mod fake {
             Ok(Box::new(FakeProcess {
                 argv,
                 stopped: self.stopped.clone(),
+                finished: self.finished.clone(),
             }))
         }
 

@@ -20,6 +20,7 @@ use crate::app::App;
 use crate::config::keys;
 use crate::env::BackendMode;
 use crate::host::fake::FakeRunner;
+use crate::sounds::fake::FakeAmplifier;
 use crate::testing::{self, call, call_with_headers};
 
 const BOUNDARY: &str = "gate-boundary-7f3a";
@@ -285,6 +286,27 @@ async fn playing_a_sound_stops_the_one_still_playing() {
     // The new sound is now the current one: the next play stops it.
     s.get("/api/v1/sounds/play/notification").await;
     assert_eq!(s.stopped(), vec![notification, finished]);
+}
+
+/// Not in the Python, which keeps the amplifier on. A sound from the API must
+/// reach the amplifier, or the speaker stays silent on a machine: `play` starts
+/// the thread that `drive_amplifier` runs in, and a finished player is not
+/// stopped again (`State::playing` is cleared). Without `watch_amplifier` in
+/// `play`, the amplifier would never turn on and this would fail.
+#[tokio::test]
+async fn a_played_sound_turns_the_amplifier_on_until_its_player_ends() {
+    let s = sounds();
+    let amplifier = Arc::new(FakeAmplifier::default());
+    amplifier.stream_starts();
+    s.app.sounds.set_amplifier(amplifier.clone());
+
+    s.get("/api/v1/sounds/play/notification").await;
+    amplifier.wait_for(&[true]);
+
+    s.runner.finished.store(true, Ordering::SeqCst);
+    amplifier.wait_for(&[true, false]);
+    s.get("/api/v1/sounds/play/brewing_end").await;
+    assert!(s.stopped().is_empty());
 }
 
 /// tests/test_api_sounds.py::TestPlaySoundRoute::test_playback_failure_is_reported_as_not_found

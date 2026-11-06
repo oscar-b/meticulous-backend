@@ -1,7 +1,14 @@
 //! `sounds.py`: event sounds from a theme folder, played with gst-play.
+//!
+//! Deliberate change: the Python keeps the speaker amplifier on from `init`.
+//! Here it is on only during a sound. The WM8904 powers down about 10 s after
+//! a sound (5 s PulseAudio suspend, 5 s ASoC `pmdown_time`). Its power-up and
+//! power-down crackle on the speaker unless the amplifier is off by then, so
+//! the amplifier turns on once the stream runs and off when the player ends.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde_json::{Map, Value};
@@ -40,6 +47,18 @@ impl SoundEvent {
 pub const DEFAULT_THEME: &str = "default";
 const AUDIO_ENABLE_GPIO_CHIP: &str = "/dev/gpiochip4";
 const AUDIO_ENABLE_GPIO_LINE: u32 = 25;
+/// The ALSA playback stream: `state: RUNNING` once the codec has started and
+/// `closed` when PulseAudio suspended the sink. By the card's ID, a link to
+/// its `cardN` folder, so that this follows the card as PulseAudio does.
+const PCM_STATUS: &str = "/proc/asound/wm8904audio/pcm0p/sub0/status";
+/// How often the stream is checked while a sound starts.
+const STREAM_POLL: Duration = Duration::from_millis(5);
+/// How often the player is checked during a sound.
+const PLAYER_POLL: Duration = Duration::from_millis(50);
+/// Fallback only: the stream normally reports `RUNNING` well before this
+/// (about 155 ms on a machine). If it does not, the amplifier turns on anyway,
+/// so that a wrong status path or a very slow start cannot silence a sound.
+const AMPLIFIER_ON_LIMIT: Duration = Duration::from_millis(500);
 /// playsound3's `gst_play` backend: what `playsound(path, block=False)` runs.
 const PLAYER: [&str; 3] = ["gst-play-1.0", "--no-interactive", "--quiet"];
 
@@ -65,6 +84,32 @@ impl Theme {
     }
 }
 
+/// The speaker amplifier and what tells when it may turn on.
+pub trait Amplifier: Send + Sync {
+    fn set(&self, on: bool);
+    /// Has the codec started, so that the speaker hears none of its start?
+    fn stream_running(&self) -> bool;
+}
+
+struct GpioAmplifier(gpiocdev::Request);
+
+impl Amplifier for GpioAmplifier {
+    fn set(&self, on: bool) {
+        let value = if on {
+            gpiocdev::line::Value::Active
+        } else {
+            gpiocdev::line::Value::Inactive
+        };
+        if let Err(error) = self.0.set_value(AUDIO_ENABLE_GPIO_LINE, value) {
+            tracing::warn!("Could not set the amplifier: {error}");
+        }
+    }
+
+    fn stream_running(&self) -> bool {
+        pcm_running(Path::new(PCM_STATUS))
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// `None` until `init` ran (`KNOWN_THEMES is None`).
@@ -74,6 +119,8 @@ struct State {
     theme_config: Map<String, Value>,
     current_theme: Option<String>,
     playing: Option<Box<dyn Process>>,
+    /// Tells a sound from the one that replaced it.
+    generation: u64,
 }
 
 pub struct SoundPlayer {
@@ -82,8 +129,9 @@ pub struct SoundPlayer {
     system_sounds: PathBuf,
     user_sounds: PathBuf,
     fake_hardware: bool,
-    state: Mutex<State>,
-    audio_pin: Mutex<Option<gpiocdev::Request>>,
+    state: Arc<Mutex<State>>,
+    /// `None` in emulation, with the hardware faked, or if the GPIO request failed.
+    amplifier: Mutex<Option<Arc<dyn Amplifier>>>,
     /// Every event asked for, played or not: what the Python suite records
     /// in place of `SoundPlayer.play_event_sound`.
     #[cfg(test)]
@@ -104,14 +152,14 @@ impl SoundPlayer {
             system_sounds,
             user_sounds,
             fake_hardware,
-            state: Mutex::new(State::default()),
-            audio_pin: Mutex::new(None),
+            state: Arc::new(Mutex::new(State::default())),
+            amplifier: Mutex::new(None),
             #[cfg(test)]
             events: Mutex::new(Vec::new()),
         }
     }
 
-    /// `SoundPlayer.init`: enable the amplifier, find the themes, set the
+    /// `SoundPlayer.init`: take the amplifier, find the themes, set the
     /// volume and the configured theme, play the startup sound.
     pub fn init(&self, emulation: bool, play_startup_sound: bool) {
         if !emulation && !self.fake_hardware {
@@ -119,10 +167,10 @@ impl SoundPlayer {
                 .on_chip(AUDIO_ENABLE_GPIO_CHIP)
                 .with_consumer("sounds")
                 .with_line(AUDIO_ENABLE_GPIO_LINE)
-                .as_output(gpiocdev::line::Value::Active)
+                .as_output(gpiocdev::line::Value::Inactive)
                 .request()
             {
-                Ok(request) => *self.audio_pin.lock() = Some(request),
+                Ok(request) => *self.amplifier.lock() = Some(Arc::new(GpioAmplifier(request))),
                 Err(error) => tracing::error!("Failed to set GPIO pin: {error}"),
             }
         }
@@ -300,6 +348,8 @@ impl SoundPlayer {
         match self.host.start(&argv) {
             Ok(process) => {
                 state.playing = Some(process);
+                state.generation += 1;
+                self.watch_amplifier(state.generation);
                 true
             }
             Err(error) => {
@@ -308,6 +358,65 @@ impl SoundPlayer {
             }
         }
     }
+
+    /// Run the amplifier for this sound, from a thread that ends with it.
+    fn watch_amplifier(&self, generation: u64) {
+        let Some(amplifier) = self.amplifier.lock().clone() else {
+            return;
+        };
+        let state = self.state.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("sound-amplifier".to_string())
+            .spawn(move || drive_amplifier(amplifier.as_ref(), &state, generation))
+        {
+            tracing::error!("Failed to watch the sound: {error}");
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_amplifier(&self, amplifier: Arc<dyn Amplifier>) {
+        *self.amplifier.lock() = Some(amplifier);
+    }
+}
+
+/// Turn the amplifier on once the stream runs and off when the player ends.
+/// A newer sound takes over: the amplifier stays on and this thread just ends.
+fn drive_amplifier(amplifier: &dyn Amplifier, state: &Mutex<State>, generation: u64) {
+    let deadline = Instant::now() + AMPLIFIER_ON_LIMIT;
+    let mut on = false;
+    while still_playing(amplifier, state, generation) {
+        if !on {
+            on = amplifier.stream_running();
+            if !on && Instant::now() >= deadline {
+                tracing::warn!("The sound stream did not start, turning the amplifier on");
+                on = true;
+            }
+            if on {
+                amplifier.set(true);
+            }
+        }
+        std::thread::sleep(if on { PLAYER_POLL } else { STREAM_POLL });
+    }
+}
+
+/// Is this sound still the current one, with its player running? The current
+/// sound's end turns the amplifier off under the lock, so a sound that starts
+/// now can only turn it on after that.
+fn still_playing(amplifier: &dyn Amplifier, state: &Mutex<State>, generation: u64) -> bool {
+    let mut state = state.lock();
+    if state.generation != generation {
+        return false;
+    }
+    if state.playing.as_mut().is_none_or(|p| p.finished()) {
+        state.playing = None;
+        amplifier.set(false);
+        return false;
+    }
+    true
+}
+
+fn pcm_running(status: &Path) -> bool {
+    std::fs::read_to_string(status).is_ok_and(|text| text.contains("state: RUNNING"))
 }
 
 fn theme<'a>(themes: &'a Themes, name: &str) -> Option<&'a Theme> {
@@ -379,5 +488,174 @@ fn load_theme(themes: &Themes, name: &str) -> Option<Map<String, Value>> {
     match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(map)) => Some(map),
         _ => Some(Map::new()),
+    }
+}
+
+#[cfg(test)]
+pub mod fake {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use parking_lot::Mutex;
+
+    use super::Amplifier;
+
+    /// Records every change of the amplifier; `running` is the stream.
+    #[derive(Default)]
+    pub struct FakeAmplifier {
+        pub running: AtomicBool,
+        pub changes: Mutex<Vec<bool>>,
+    }
+
+    impl FakeAmplifier {
+        pub fn stream_starts(&self) {
+            self.running.store(true, Ordering::SeqCst);
+        }
+
+        /// Wait for the amplifier's thread to reach `expected`.
+        pub fn wait_for(&self, expected: &[bool]) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.changes.lock().as_slice() != expected && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(self.changes.lock().as_slice(), expected);
+        }
+    }
+
+    impl Amplifier for FakeAmplifier {
+        fn set(&self, on: bool) {
+            self.changes.lock().push(on);
+        }
+
+        fn stream_running(&self) -> bool {
+            self.running.load(Ordering::SeqCst)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+    use std::thread::JoinHandle;
+
+    use super::fake::FakeAmplifier;
+    use super::*;
+    use crate::host::CommandRunner as _;
+    use crate::host::fake::FakeRunner;
+
+    struct Watched {
+        amplifier: Arc<FakeAmplifier>,
+        runner: FakeRunner,
+        state: Arc<Mutex<State>>,
+        thread: JoinHandle<()>,
+    }
+
+    /// One sound with its player running and the amplifier's thread started.
+    fn watched(stream_running: bool) -> Watched {
+        let amplifier = Arc::new(FakeAmplifier::default());
+        if stream_running {
+            amplifier.stream_starts();
+        }
+        let runner = FakeRunner::default();
+        let process = runner.start(&["gst-play-1.0"]).expect("started");
+        let state = Arc::new(Mutex::new(State {
+            playing: Some(process),
+            generation: 1,
+            ..State::default()
+        }));
+        let thread = std::thread::spawn({
+            let amplifier = amplifier.clone();
+            let state = state.clone();
+            move || drive_amplifier(&*amplifier, &state, 1)
+        });
+        Watched {
+            amplifier,
+            runner,
+            state,
+            thread,
+        }
+    }
+
+    impl Watched {
+        fn player_ends(&self) {
+            self.runner.finished.store(true, Ordering::SeqCst);
+        }
+
+        fn thread_ends(self) -> Vec<bool> {
+            self.thread.join().expect("the amplifier's thread");
+            self.amplifier.changes.lock().clone()
+        }
+    }
+
+    /// A user hears the crackle before every sound after an idle time if the
+    /// amplifier turns on before the stream runs, and the amplifier wastes
+    /// power and passes the codec's power-down noise if it stays on after the
+    /// player. The order comes from `drive_amplifier`, and a test on a machine:
+    /// amplifier on at `RUNNING`, off at the end, no crackle. Without the wait
+    /// for the stream, the first assert would fail.
+    #[test]
+    fn amplifier_waits_for_the_stream_and_ends_with_the_player() {
+        let sound = watched(false);
+        std::thread::sleep(STREAM_POLL * 3);
+        assert!(sound.amplifier.changes.lock().is_empty());
+
+        sound.amplifier.stream_starts();
+        sound.amplifier.wait_for(&[true]);
+
+        sound.player_ends();
+        assert_eq!(sound.thread_ends(), [true, false]);
+    }
+
+    /// An alert (no water) stays audible if the stream state cannot be read:
+    /// after `AMPLIFIER_ON_LIMIT` the amplifier turns on anyway. Without the
+    /// limit, the amplifier would never turn on and this test would fail.
+    #[test]
+    fn a_stream_that_never_reports_running_still_gets_the_amplifier() {
+        let start = Instant::now();
+        let sound = watched(false);
+        sound.amplifier.wait_for(&[true]);
+        assert!(start.elapsed() >= AMPLIFIER_ON_LIMIT);
+
+        sound.player_ends();
+        assert_eq!(sound.thread_ends(), [true, false]);
+    }
+
+    /// A sound that replaces another keeps the amplifier on: the older sound's
+    /// thread must not cut the new sound off. Without the generation check,
+    /// the old thread would turn the amplifier off.
+    #[test]
+    fn a_replaced_sound_leaves_the_amplifier_to_the_new_one() {
+        let sound = watched(true);
+        sound.amplifier.wait_for(&[true]);
+
+        sound.state.lock().generation = 2;
+        sound.player_ends();
+        assert_eq!(sound.thread_ends(), [true]);
+    }
+
+    /// A sound that ends before its stream runs (a player that cannot open
+    /// the file) leaves the amplifier off, and its thread ends. Without the
+    /// check in the loop, the amplifier would turn on after the limit.
+    #[test]
+    fn a_player_that_ends_before_the_stream_keeps_the_amplifier_off() {
+        let sound = watched(false);
+        sound.player_ends();
+        assert_eq!(sound.thread_ends(), [false]);
+    }
+
+    /// The kernel's status file: `closed` while idle, and the `state: RUNNING`
+    /// a machine printed during a sound. A missing file (a renamed card) is not
+    /// a running stream. Reading any text as running would fail here.
+    #[test]
+    fn only_a_running_stream_counts_as_running() {
+        let dir = tempfile::tempdir().expect("temporary folder");
+        let status = dir.path().join("status");
+        assert!(!pcm_running(&status));
+
+        std::fs::write(&status, "closed\n").expect("status");
+        assert!(!pcm_running(&status));
+
+        std::fs::write(&status, "state: RUNNING\nowner_pid   : 1042\n").expect("status");
+        assert!(pcm_running(&status));
     }
 }
